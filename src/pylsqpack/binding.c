@@ -8,6 +8,49 @@
 
 #define MODULE_NAME "pylsqpack._binding"
 
+/*
+ * Internal struct definitions copied from lsqpack.c for dynamic table
+ * inspection. These are stable internal types used by the ls-qpack library.
+ */
+#define DYNAMIC_ENTRY_OVERHEAD 32u
+
+struct lsqpack_dec_table_entry {
+    unsigned    dte_name_len;
+    unsigned    dte_val_len;
+    unsigned    dte_refcnt;
+    unsigned    dte_name_hash;
+    unsigned    dte_nameval_hash;
+    unsigned    dte_name_idx;
+    enum {
+        DTEF_NAME_HASH      = 1 << 0,
+        DTEF_NAMEVAL_HASH   = 1 << 1,
+        DTEF_NAME_IDX       = 1 << 2,
+    }           dte_flags;
+    char        dte_buf[0];
+};
+
+#define DTE_NAME(dte) ((dte)->dte_buf)
+#define DTE_VALUE(dte) (&(dte)->dte_buf[(dte)->dte_name_len])
+
+struct lsqpack_enc_table_entry {
+    STAILQ_ENTRY(lsqpack_enc_table_entry)
+                                    ete_next_nameval,
+                                    ete_next_name,
+                                    ete_next_all;
+    lsqpack_abs_id_t                ete_id;
+    unsigned                        ete_when_added_used;
+    unsigned                        ete_when_added_dropped;
+    unsigned                        ete_n_reffd;
+    unsigned                        ete_nameval_hash;
+    unsigned                        ete_name_hash;
+    unsigned                        ete_name_len;
+    unsigned                        ete_val_len;
+    char                            ete_buf[0];
+};
+
+#define ETE_NAME(ete) ((ete)->ete_buf)
+#define ETE_VALUE(ete) (&(ete)->ete_buf[(ete)->ete_name_len])
+
 #define DEC_BUF_SZ 4096
 #define ENC_BUF_SZ 4096
 #define HDR_BUF_SZ 4096
@@ -319,10 +362,68 @@ Decoder_resume_header(DecoderObject *self, PyObject *args, PyObject *kwargs)
     return tuple;
 }
 
+PyDoc_STRVAR(Decoder_get_dynamic_table__doc__,
+    "get_dynamic_table() -> dict\n\n"
+    "Return the current state of the QPACK dynamic table.\n\n"
+    "The returned dict contains:\n"
+    "  - ``max_capacity``: the maximum table capacity in bytes\n"
+    "  - ``current_capacity``: the current table size in bytes\n"
+    "  - ``entries``: a list of ``(name, value)`` byte-string tuples\n");
+
+static PyObject*
+Decoder_get_dynamic_table(DecoderObject *self, PyObject *Py_UNUSED(args))
+{
+    PyObject *entries, *entry_tuple, *name, *value, *result;
+    const struct lsqpack_ringbuf *rbuf = &self->dec.qpd_dyn_table;
+    const struct lsqpack_dec_table_entry *entry;
+    unsigned idx;
+
+    entries = PyList_New(0);
+    if (!entries)
+        return NULL;
+
+    /* Iterate ring buffer from tail (oldest) to head (newest) */
+    if (rbuf->rb_nalloc && rbuf->rb_head != rbuf->rb_tail) {
+        idx = rbuf->rb_tail;
+        while (idx != rbuf->rb_head) {
+            entry = (const struct lsqpack_dec_table_entry *)rbuf->rb_els[idx];
+            name = PyBytes_FromStringAndSize(DTE_NAME(entry), entry->dte_name_len);
+            value = PyBytes_FromStringAndSize(DTE_VALUE(entry), entry->dte_val_len);
+            entry_tuple = PyTuple_Pack(2, name, value);
+            Py_DECREF(name);
+            Py_DECREF(value);
+            if (PyList_Append(entries, entry_tuple) < 0) {
+                Py_DECREF(entry_tuple);
+                Py_DECREF(entries);
+                return NULL;
+            }
+            Py_DECREF(entry_tuple);
+            idx = (idx + 1) % rbuf->rb_nalloc;
+        }
+    }
+
+    result = PyDict_New();
+    if (!result) {
+        Py_DECREF(entries);
+        return NULL;
+    }
+    value = PyLong_FromUnsignedLong(self->dec.qpd_cur_max_capacity);
+    PyDict_SetItemString(result, "max_capacity", value);
+    Py_DECREF(value);
+    value = PyLong_FromUnsignedLong(self->dec.qpd_cur_capacity);
+    PyDict_SetItemString(result, "current_capacity", value);
+    Py_DECREF(value);
+    PyDict_SetItemString(result, "entries", entries);
+    Py_DECREF(entries);
+
+    return result;
+}
+
 static PyMethodDef Decoder_methods[] = {
     {"feed_encoder", (PyCFunction)Decoder_feed_encoder, METH_VARARGS | METH_KEYWORDS, Decoder_feed_encoder__doc__},
     {"feed_header", (PyCFunction)Decoder_feed_header, METH_VARARGS | METH_KEYWORDS, Decoder_feed_header__doc__},
     {"resume_header", (PyCFunction)Decoder_resume_header, METH_VARARGS | METH_KEYWORDS, Decoder_resume_header__doc__},
+    {"get_dynamic_table", (PyCFunction)Decoder_get_dynamic_table, METH_NOARGS, Decoder_get_dynamic_table__doc__},
     {NULL}
 };
 
@@ -515,10 +616,60 @@ Encoder_feed_decoder(EncoderObject *self, PyObject *args, PyObject *kwargs)
     Py_RETURN_NONE;
 }
 
+PyDoc_STRVAR(Encoder_get_dynamic_table__doc__,
+    "get_dynamic_table() -> dict\n\n"
+    "Return the current state of the QPACK dynamic table.\n\n"
+    "The returned dict contains:\n"
+    "  - ``max_capacity``: the maximum table capacity in bytes\n"
+    "  - ``current_capacity``: the current table size in bytes\n"
+    "  - ``entries``: a list of ``(name, value)`` byte-string tuples\n");
+
+static PyObject*
+Encoder_get_dynamic_table(EncoderObject *self, PyObject *Py_UNUSED(args))
+{
+    PyObject *entries, *entry_tuple, *name, *value, *result;
+    struct lsqpack_enc_table_entry *entry;
+
+    entries = PyList_New(0);
+    if (!entries)
+        return NULL;
+
+    STAILQ_FOREACH(entry, &self->enc.qpe_all_entries, ete_next_all) {
+        name = PyBytes_FromStringAndSize(ETE_NAME(entry), entry->ete_name_len);
+        value = PyBytes_FromStringAndSize(ETE_VALUE(entry), entry->ete_val_len);
+        entry_tuple = PyTuple_Pack(2, name, value);
+        Py_DECREF(name);
+        Py_DECREF(value);
+        if (PyList_Append(entries, entry_tuple) < 0) {
+            Py_DECREF(entry_tuple);
+            Py_DECREF(entries);
+            return NULL;
+        }
+        Py_DECREF(entry_tuple);
+    }
+
+    result = PyDict_New();
+    if (!result) {
+        Py_DECREF(entries);
+        return NULL;
+    }
+    value = PyLong_FromUnsignedLong(self->enc.qpe_cur_max_capacity);
+    PyDict_SetItemString(result, "max_capacity", value);
+    Py_DECREF(value);
+    value = PyLong_FromUnsignedLong(self->enc.qpe_cur_bytes_used);
+    PyDict_SetItemString(result, "current_capacity", value);
+    Py_DECREF(value);
+    PyDict_SetItemString(result, "entries", entries);
+    Py_DECREF(entries);
+
+    return result;
+}
+
 static PyMethodDef Encoder_methods[] = {
     {"apply_settings", (PyCFunction)Encoder_apply_settings, METH_VARARGS | METH_KEYWORDS, Encoder_apply_settings__doc__},
     {"encode", (PyCFunction)Encoder_encode, METH_VARARGS | METH_KEYWORDS, Encoder_encode__doc__},
     {"feed_decoder", (PyCFunction)Encoder_feed_decoder, METH_VARARGS | METH_KEYWORDS, Encoder_feed_decoder__doc__},
+    {"get_dynamic_table", (PyCFunction)Encoder_get_dynamic_table, METH_NOARGS, Encoder_get_dynamic_table__doc__},
     {NULL}
 };
 
