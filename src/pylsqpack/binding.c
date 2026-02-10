@@ -1,4 +1,4 @@
-#define PY_SSIZE_T_CLEAN
+#define PY_SSIZE_T_CLEAN // Uses ssize_t instead of int for lengths
 
 #include <assert.h>
 
@@ -15,24 +15,35 @@
 #define DYNAMIC_ENTRY_OVERHEAD 32u
 
 struct lsqpack_dec_table_entry {
-    unsigned    dte_name_len;
-    unsigned    dte_val_len;
-    unsigned    dte_refcnt;
-    unsigned    dte_name_hash;
-    unsigned    dte_nameval_hash;
-    unsigned    dte_name_idx;
+    unsigned dte_name_len; // Header length
+    unsigned dte_val_len; // Header value
+    unsigned dte_refcnt; //  # of in-flight header blocks that reference this entry
+    unsigned dte_name_hash;
+    unsigned dte_nameval_hash;
+    unsigned dte_name_idx; // Index in static table (if it exists)
+
+    // Bitfield tracking
     enum {
         DTEF_NAME_HASH      = 1 << 0,
         DTEF_NAMEVAL_HASH   = 1 << 1,
         DTEF_NAME_IDX       = 1 << 2,
     }           dte_flags;
-    char        dte_buf[0];
+
+    char dte_buf[0]; // Name + value bytes
 };
 
+// Access to name and value within buffer
 #define DTE_NAME(dte) ((dte)->dte_buf)
 #define DTE_VALUE(dte) (&(dte)->dte_buf[(dte)->dte_name_len])
 
 struct lsqpack_enc_table_entry {
+
+    /*
+     * Encoder maintains 3 linked lists for entry lookup
+     *  - nameval = name + value
+     *  - name = name only
+     *  - all = list of all entries
+     */
     STAILQ_ENTRY(lsqpack_enc_table_entry)
                                     ete_next_nameval,
                                     ete_next_name,
@@ -40,12 +51,12 @@ struct lsqpack_enc_table_entry {
     lsqpack_abs_id_t                ete_id;
     unsigned                        ete_when_added_used;
     unsigned                        ete_when_added_dropped;
-    unsigned                        ete_n_reffd;
+    unsigned                        ete_n_reffd; // # of in-flight header blocks that reference this entry
     unsigned                        ete_nameval_hash;
     unsigned                        ete_name_hash;
     unsigned                        ete_name_len;
     unsigned                        ete_val_len;
-    char                            ete_buf[0];
+    char                            ete_buf[0]; // Name + value bytes
 };
 
 #define ETE_NAME(ete) ((ete)->ete_buf)
@@ -53,8 +64,8 @@ struct lsqpack_enc_table_entry {
 
 #define DEC_BUF_SZ 4096
 #define ENC_BUF_SZ 4096
-#define HDR_BUF_SZ 4096
-#define XHDR_BUF_SZ 4096
+#define HDR_BUF_SZ 4096 // Header block buffer
+#define XHDR_BUF_SZ 4096 // Temporary buffer to assemble header during encoding
 #define PREFIX_MAX_SIZE 16
 
 static PyObject *DecompressionFailed;
@@ -101,13 +112,19 @@ static void header_block_free(struct header_block *hblock)
     free(hblock);
 }
 
+/*
+ * ls-qpack calls when previously blocked stream becomes unblocked
+ */
 static void header_block_unblocked(void *opaque) {
     struct header_block *hblock = opaque;
     hblock->blocked = 0;
 }
 
 /**
- * Prepare to decode a header by allocating the requested memory.
+ * Called by ls-qpack before decoding each header, asks the binding to provide a buffer of 'space' bytes
+ * Two cases to handle
+ *  - xhdr != NULL, previous buffer was too small, existing xhdr is reused but buffer is realloc'd larger
+ *  - xhdr == NULL, first time header is being decoded, fresh xhdr is initialized 
  */
 static struct lsxpack_header *header_block_prepare_decode(void *opaque, struct lsxpack_header *xhdr, size_t space) {
     struct header_block *hblock = opaque;
@@ -130,6 +147,7 @@ static struct lsxpack_header *header_block_prepare_decode(void *opaque, struct l
 
 /**
  * Process a decoded header by appending it to the list of headers.
+ * Extracts name and value from the xhdr, packs them into a tuple, and appends to hblock->headers
  */
 static int header_block_process_header(void *opaque, struct lsxpack_header *xhdr) {
     struct header_block *hblock = opaque;
@@ -147,21 +165,33 @@ static int header_block_process_header(void *opaque, struct lsxpack_header *xhdr
     return 0;
 }
 
+/*
+ * Bundles callbacks together
+ * Passed to lsqpack_dec_init so decoder knows how to communicate back
+ */
 static const struct lsqpack_dec_hset_if header_block_if = {
     .dhi_unblocked = header_block_unblocked,
     .dhi_prepare_decode = header_block_prepare_decode,
     .dhi_process_header = header_block_process_header,
 };
 
+
+
+
 // DECODER
 
 typedef struct {
     PyObject_HEAD
-    struct lsqpack_dec dec;
-    unsigned char dec_buf[DEC_BUF_SZ];
-    STAILQ_HEAD(, header_block) pending_blocks;
+    struct lsqpack_dec dec; // Decoder state struct
+    unsigned char dec_buf[DEC_BUF_SZ]; // Buffer for decoder stream output back to encoder
+    STAILQ_HEAD(, header_block) pending_blocks; // Stailq of header_block structs for blocked streams
 } DecoderObject;
 
+
+/*
+ * Parses two unsigned kwargs, then calls lsqpack_dec_init to initialize underlying C decoder with those settings and the callback table
+ * Additionally intializes pending-blocks queue
+ */
 static int
 Decoder_init(DecoderObject *self, PyObject *args, PyObject *kwargs)
 {
@@ -177,6 +207,9 @@ Decoder_init(DecoderObject *self, PyObject *args, PyObject *kwargs)
     return 0;
 }
 
+/*
+ * Cleans up and frees ls-qpack decoder
+ */
 static void
 Decoder_dealloc(DecoderObject *self)
 {
@@ -196,6 +229,12 @@ Decoder_dealloc(DecoderObject *self)
     Py_DECREF(tp);
 }
 
+/*
+ * Feeds data from encoder stream into decoder.
+ *  - Calls lsqpack_dec_enc_in to trigger any header_block_unblock callbacks on any pending blocks that were waiting for this data
+ *  - Iterates over all pending blocks and returns their stream_id so caller knows what streams to use resume_header on
+ *  - Decoder learns of dynamic table insertions
+ */
 PyDoc_STRVAR(Decoder_feed_encoder__doc__,
     "feed_encoder(data: bytes) -> List[int]\n\n"
     "Feed data from the encoder stream.\n\n"
@@ -362,6 +401,10 @@ Decoder_resume_header(DecoderObject *self, PyObject *args, PyObject *kwargs)
     return tuple;
 }
 
+/*
+ * Iterates the decoder's ring buffer (qpd_dyn_table) and extracts name and value bytes into python tuples
+ * Returns a dict with max_capacity, current_capacity, and 'entries' list
+ */
 PyDoc_STRVAR(Decoder_get_dynamic_table__doc__,
     "get_dynamic_table() -> dict\n\n"
     "Return the current state of the QPACK dynamic table.\n\n"
@@ -419,6 +462,7 @@ Decoder_get_dynamic_table(DecoderObject *self, PyObject *Py_UNUSED(args))
     return result;
 }
 
+// Decoder method table
 static PyMethodDef Decoder_methods[] = {
     {"feed_encoder", (PyCFunction)Decoder_feed_encoder, METH_VARARGS | METH_KEYWORDS, Decoder_feed_encoder__doc__},
     {"feed_header", (PyCFunction)Decoder_feed_header, METH_VARARGS | METH_KEYWORDS, Decoder_feed_header__doc__},
@@ -457,9 +501,13 @@ typedef struct {
     unsigned char hdr_buf[HDR_BUF_SZ];
     unsigned char enc_buf[ENC_BUF_SZ];
     unsigned char pfx_buf[PREFIX_MAX_SIZE];
-    char xhdr_buf[XHDR_BUF_SZ];
+    char xhdr_buf[XHDR_BUF_SZ]; // Temporary buffer for assembling header name and value before encoding
 } EncoderObject;
 
+/*
+ * Minimal encoder setup
+ * For full initialization, see apply_settings. Encoder must know peer's table capacity and blocked-stream limit first
+ */
 static int
 Encoder_init(EncoderObject *self, PyObject *args, PyObject *kwargs)
 {
@@ -467,6 +515,9 @@ Encoder_init(EncoderObject *self, PyObject *args, PyObject *kwargs)
     return 0;
 }
 
+/*
+ * Cleans up and frees ls-qpack encoder
+ */
 static void
 Encoder_dealloc(EncoderObject *self)
 {
@@ -478,6 +529,7 @@ Encoder_dealloc(EncoderObject *self)
     Py_DECREF(tp);
 }
 
+// Fully initializes encoder
 PyDoc_STRVAR(Encoder_apply_settings__doc__,
     "apply_settings(max_table_capacity: int, blocked_streams: int) -> bytes\n\n"
     "Apply the settings received from the encoder.\n\n"
@@ -707,6 +759,13 @@ static struct PyModuleDef moduledef = {
     NULL,                               /* m_free */
 };
 
+/*
+ * Module initialization function, called by Python when import pylsqpack._binding runs
+ *  - Creates module with PyModule_Create
+ *  - Creates custom exception types
+ *  - Creates decoder and encoder types from PyType_FromSpec
+ *  - Returns module object
+*/
 PyMODINIT_FUNC
 PyInit__binding(void)
 {
